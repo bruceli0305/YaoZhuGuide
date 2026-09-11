@@ -26,6 +26,8 @@ YaoZhuGuide.vcxproj      x64 DLL 工程
 YaoZhuGuide.ini          默认配置
 assets/                  Nexus Quick Access 图标
 fetch-webview2.nu        下载并解压 WebView2 C++ SDK
+release/                 已验证的发布安装包
+.github/workflows/       GitHub Release 工作流
 ```
 
 `vendor/`、`build/` 和 `.vs/` 都是本地构建产物，不提交到仓库。
