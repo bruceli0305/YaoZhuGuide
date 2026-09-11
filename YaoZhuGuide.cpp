@@ -2223,7 +2223,8 @@ void AddonUnload()
 extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef()
 {
     static AddonDefinition_t definition{
-        static_cast<uint32_t>(-20260910),
+        // Raidcore assigns this identity; the Addon Library entry must use the same 8 hex digits.
+        0xEA4022D7u,
         kNexusApiVersion,
         "小夭竺宝典",
         {1, 0, 1, 0},
