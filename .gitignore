@@ -1,0 +1,6 @@
+/vendor/
+/build/
+.vs/
+*.user
+*.suo
+*.VC.db
