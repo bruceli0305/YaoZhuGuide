@@ -23,4 +23,4 @@ jobs:
             "release/YaoZhuGuide-${{ github.ref_name }}.zip" \
             --repo "${{ github.repository }}" \
             --title "小夭竺宝典 ${{ github.ref_name }}" \
-            --notes "首个可手动安装版本。包含 YaoZhuGuide.dll、YaoZhuGuide.ini 和 YaoZhuGuideIcon.png。"
+            --notes "v1.0.1：新增 WebView2 Runtime 检测提示、UTF-8 诊断日志和崩溃转储。包含 YaoZhuGuide.dll、YaoZhuGuide.ini 和 YaoZhuGuideIcon.png。"

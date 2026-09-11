@@ -3,6 +3,7 @@
 #include <CommCtrl.h>
 #include <ShlObj.h>
 #include <shellapi.h>
+#include <dbghelp.h>
 #include <wrl.h>
 #include <WebView2.h>
 
@@ -156,12 +157,29 @@ constexpr int kOpacitySliderWidth = 180;
 constexpr int kMinimizeButtonId = 1002;
 constexpr int kMaximizeButtonId = 1003;
 constexpr int kCloseButtonId = 1004;
+constexpr int kRuntimeErrorTitleId = 1005;
+constexpr int kRuntimeErrorDetailId = 1006;
+constexpr int kRuntimeOpenButtonId = 1007;
+constexpr int kRuntimeRetryButtonId = 1008;
+constexpr int kRuntimeCloseButtonId = 1009;
+constexpr int kRuntimeErrorPanelWidth = 760;
+constexpr int kRuntimeErrorPanelHeight = 146;
+constexpr int kRuntimeErrorTitleHeight = 32;
+constexpr int kRuntimeErrorDetailHeight = 56;
+constexpr int kRuntimeErrorButtonWidth = 150;
+constexpr int kRuntimeErrorButtonHeight = 30;
+constexpr int kRuntimeErrorButtonGap = 12;
 constexpr int kTitleTextWidth = 104;
 constexpr int kTitleButtonWidth = 34;
 constexpr int kTitleButtonCount = 3;
 constexpr int kMinOpacityPercent = 30;
 constexpr int kMaxOpacityPercent = 100;
 constexpr int kDefaultOpacityPercent = 100;
+constexpr wchar_t kWebView2DownloadUrl[] =
+    L"https://developer.microsoft.com/microsoft-edge/webview2/";
+constexpr wchar_t kLogFileName[] = L"YaoZhuGuide.log";
+constexpr wchar_t kCrashDumpDirectoryName[] = L"CrashDumps";
+constexpr std::uint64_t kMaxLogFileBytes = 2u * 1024u * 1024u;
 constexpr uint32_t kNexusApiVersion = 6;
 constexpr char kQuickAccessIdentifier[] = "QAS_YAOZHUGUIDE";
 constexpr char kKeybindIdentifier[] = "KB_YAOZHUGUIDE_TOGGLE";
@@ -179,6 +197,10 @@ std::atomic<DWORD> g_browserThreadId = 0;
 std::thread g_browserThread;
 std::mutex g_browserThreadMutex;
 std::atomic_bool g_browserThreadRunning = false;
+std::mutex g_logMutex;
+std::atomic_bool g_crashDumpInProgress = false;
+LPTOP_LEVEL_EXCEPTION_FILTER g_previousUnhandledExceptionFilter = nullptr;
+bool g_crashHandlerInstalled = false;
 
 HWND g_opacityLabel = nullptr;
 HWND g_opacitySlider = nullptr;
@@ -186,6 +208,13 @@ HWND g_opacityValueLabel = nullptr;
 HWND g_minimizeButton = nullptr;
 HWND g_maximizeButton = nullptr;
 HWND g_closeButton = nullptr;
+HWND g_runtimeErrorTitle = nullptr;
+HWND g_runtimeErrorDetail = nullptr;
+HWND g_runtimeOpenButton = nullptr;
+HWND g_runtimeRetryButton = nullptr;
+HWND g_runtimeCloseButton = nullptr;
+bool g_runtimeErrorVisible = false;
+std::wstring g_browserUrl;
 std::wstring g_windowStatus = kAddonDisplayName;
 ComPtr<ICoreWebView2Controller> g_controller;
 ComPtr<ICoreWebView2> g_webView;
@@ -278,6 +307,293 @@ std::string WideToUtf8(const std::wstring& value)
     return result;
 }
 
+/*
+ * Keep diagnostics outside the addon installation directory. The same
+ * per-user directory is shared by the WebView2 profile, the text log, and
+ * crash dumps so a read-only or updated addon folder cannot lose diagnostics.
+ */
+std::wstring GetAddonLocalDataDirectory()
+{
+    PWSTR localAppDataPath = nullptr;
+    if (FAILED(SHGetKnownFolderPath(
+            FOLDERID_LocalAppData,
+            KF_FLAG_DEFAULT,
+            nullptr,
+            &localAppDataPath))
+        || !localAppDataPath)
+    {
+        return {};
+    }
+
+    const std::wstring addonDirectory =
+        std::wstring(localAppDataPath) + L"\\" + kAddonFileBaseName;
+    CoTaskMemFree(localAppDataPath);
+
+    if (!CreateDirectoryW(addonDirectory.c_str(), nullptr)
+        && GetLastError() != ERROR_ALREADY_EXISTS)
+    {
+        return {};
+    }
+    return addonDirectory;
+}
+
+std::wstring GetLogPath()
+{
+    const std::wstring addonDirectory = GetAddonLocalDataDirectory();
+    return addonDirectory.empty()
+        ? std::wstring{}
+        : addonDirectory + L"\\" + kLogFileName;
+}
+
+std::wstring GetCrashDumpPath()
+{
+    const std::wstring addonDirectory = GetAddonLocalDataDirectory();
+    if (addonDirectory.empty())
+    {
+        return {};
+    }
+
+    const std::wstring crashDirectory =
+        addonDirectory + L"\\" + kCrashDumpDirectoryName;
+    if (!CreateDirectoryW(crashDirectory.c_str(), nullptr)
+        && GetLastError() != ERROR_ALREADY_EXISTS)
+    {
+        return {};
+    }
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t fileName[128]{};
+    _snwprintf_s(
+        fileName,
+        ARRAYSIZE(fileName),
+        _TRUNCATE,
+        L"YaoZhuGuide-%04u%02u%02u-%02u%02u%02u-%lu.dmp",
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+        static_cast<unsigned long>(GetCurrentProcessId()));
+    return crashDirectory + L"\\" + fileName;
+}
+
+/*
+ * Append one UTF-8 line and mirror it to the debugger. The mutex serializes
+ * browser-thread and Nexus-callback writes; a small size cap prevents a
+ * repeatedly failing addon from consuming unbounded AppData storage.
+ */
+void LogMessage(const wchar_t* level, const wchar_t* message)
+{
+    const wchar_t* safeLevel = level ? level : L"INFO";
+    const wchar_t* safeMessage = message ? message : L"";
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+
+    wchar_t line[2048]{};
+    _snwprintf_s(
+        line,
+        ARRAYSIZE(line),
+        _TRUNCATE,
+        L"[%04u-%02u-%02u %02u:%02u:%02u.%03u][pid=%lu tid=%lu][%ls] %ls\r\n",
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+        now.wMilliseconds,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        safeLevel,
+        safeMessage);
+    OutputDebugStringW(line);
+
+    try
+    {
+        const std::string utf8Line = WideToUtf8(line);
+        const std::wstring logPath = GetLogPath();
+        if (utf8Line.empty() || logPath.empty())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        HANDLE file = CreateFileW(
+            logPath.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            OutputDebugStringW(L"小夭竺宝典 - 无法打开日志文件\n");
+            return;
+        }
+
+        LARGE_INTEGER fileSize{};
+        if (GetFileSizeEx(file, &fileSize)
+            && fileSize.QuadPart > static_cast<LONGLONG>(kMaxLogFileBytes))
+        {
+            LARGE_INTEGER beginning{};
+            if (SetFilePointerEx(file, beginning, nullptr, FILE_BEGIN)
+                && SetEndOfFile(file))
+            {
+                static constexpr char resetLine[] =
+                    "--- log truncated after reaching 2 MiB ---\r\n";
+                DWORD resetBytes = 0;
+                WriteFile(
+                    file,
+                    resetLine,
+                    static_cast<DWORD>(sizeof(resetLine) - 1),
+                    &resetBytes,
+                    nullptr);
+            }
+        }
+
+        LARGE_INTEGER end{};
+        SetFilePointerEx(file, end, nullptr, FILE_END);
+        DWORD written = 0;
+        const BOOL writeResult = WriteFile(
+            file,
+            utf8Line.data(),
+            static_cast<DWORD>(utf8Line.size()),
+            &written,
+            nullptr);
+        if (writeResult && written == utf8Line.size())
+        {
+            // Flush each short diagnostic line so a sudden host crash keeps
+            // the latest completed event whenever the filesystem permits it.
+            FlushFileBuffers(file);
+        }
+        CloseHandle(file);
+    }
+    catch (...)
+    {
+        // Diagnostics must never turn an allocation or path failure into a
+        // second plugin failure; OutputDebugString remains the fallback.
+        OutputDebugStringW(L"小夭竺宝典 - 日志写入异常\n");
+    }
+}
+
+void LogHresult(const wchar_t* operation, HRESULT result)
+{
+    wchar_t message[256]{};
+    _snwprintf_s(
+        message,
+        ARRAYSIZE(message),
+        _TRUNCATE,
+        L"%ls failed (HRESULT=0x%08lX)",
+        operation ? operation : L"operation",
+        static_cast<unsigned long>(result));
+    LogMessage(L"ERROR", message);
+}
+
+/*
+ * Write a best-effort normal minidump from the process-level exception hook.
+ * The hook returns the previous filter's result afterward, so Nexus or the
+ * game retains its existing crash policy instead of being swallowed here.
+ */
+void WriteCrashDump(EXCEPTION_POINTERS* exceptionPointers)
+{
+    if (g_crashDumpInProgress.exchange(true))
+    {
+        return;
+    }
+
+    try
+    {
+        const std::wstring dumpPath = GetCrashDumpPath();
+        if (dumpPath.empty())
+        {
+            OutputDebugStringW(L"小夭竺宝典 - 无法创建崩溃转储路径\n");
+            g_crashDumpInProgress.store(false);
+            return;
+        }
+
+        HANDLE file = CreateFileW(
+            dumpPath.c_str(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            OutputDebugStringW(L"小夭竺宝典 - 无法创建崩溃转储文件\n");
+            g_crashDumpInProgress.store(false);
+            return;
+        }
+
+        MINIDUMP_EXCEPTION_INFORMATION exceptionInfo{};
+        exceptionInfo.ThreadId = GetCurrentThreadId();
+        exceptionInfo.ExceptionPointers = exceptionPointers;
+        exceptionInfo.ClientPointers = FALSE;
+        const BOOL dumpResult = MiniDumpWriteDump(
+            GetCurrentProcess(),
+            GetCurrentProcessId(),
+            file,
+            MiniDumpNormal,
+            exceptionPointers ? &exceptionInfo : nullptr,
+            nullptr,
+            nullptr);
+        CloseHandle(file);
+        OutputDebugStringW(
+            dumpResult
+                ? L"小夭竺宝典 - 崩溃转储已写入\n"
+                : L"小夭竺宝典 - 崩溃转储写入失败\n");
+        g_crashDumpInProgress.store(false);
+    }
+    catch (...)
+    {
+        OutputDebugStringW(L"小夭竺宝典 - 崩溃转储处理异常\n");
+        g_crashDumpInProgress.store(false);
+    }
+}
+
+LONG WINAPI HandleUnhandledException(EXCEPTION_POINTERS* exceptionPointers)
+{
+    WriteCrashDump(exceptionPointers);
+    if (g_previousUnhandledExceptionFilter
+        && g_previousUnhandledExceptionFilter != &HandleUnhandledException)
+    {
+        return g_previousUnhandledExceptionFilter(exceptionPointers);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/*
+ * SetUnhandledExceptionFilter is process-wide, so install it only while this
+ * addon is loaded and restore the prior callback during unload. It is used
+ * solely to capture a dump; it never converts a crash into a handled event.
+ */
+void InstallCrashHandler()
+{
+    if (g_crashHandlerInstalled)
+    {
+        return;
+    }
+    g_previousUnhandledExceptionFilter =
+        SetUnhandledExceptionFilter(&HandleUnhandledException);
+    g_crashHandlerInstalled = true;
+    LogMessage(L"INFO", L"崩溃转储处理器已安装");
+}
+
+void UninstallCrashHandler()
+{
+    if (!g_crashHandlerInstalled)
+    {
+        return;
+    }
+    SetUnhandledExceptionFilter(g_previousUnhandledExceptionFilter);
+    g_previousUnhandledExceptionFilter = nullptr;
+    g_crashHandlerInstalled = false;
+}
+
 std::wstring GetConfigPath()
 {
     return GetModuleDirectory() + kAddonFileBaseName + std::wstring(L".ini");
@@ -353,7 +669,7 @@ void PersistConfiguredOpacity()
             value.c_str(),
             configPath.c_str()))
     {
-        OutputDebugStringW(L"小夭竺宝典 - opacity configuration write failed\n");
+        LogMessage(L"ERROR", L"透明度配置写入失败");
     }
 }
 
@@ -502,9 +818,98 @@ void ApplyWindowOpacity(HWND window, int opacityPercent)
     const BYTE alpha = static_cast<BYTE>((clampedOpacity * 255 + 50) / 100);
     if (!SetLayeredWindowAttributes(window, 0, alpha, LWA_ALPHA))
     {
-        OutputDebugStringW(L"小夭竺宝典 - window opacity update failed\n");
+        LogMessage(L"ERROR", L"窗口透明度更新失败");
     }
     UpdateOpacityValueLabel(clampedOpacity);
+}
+
+/*
+ * Place the Runtime recovery panel in the same client area that WebView2 uses.
+ * It is a native fallback surface, so it remains available even when the
+ * browser environment cannot be created and no WebView2 child window exists.
+ */
+void LayoutRuntimeErrorControls(HWND window)
+{
+    if (!window)
+    {
+        return;
+    }
+
+    RECT clientBounds{};
+    if (!GetClientRect(window, &clientBounds))
+    {
+        return;
+    }
+
+    const int clientWidth = static_cast<int>(
+        std::max(0L, clientBounds.right - clientBounds.left));
+    const int clientHeight = static_cast<int>(
+        std::max(0L, clientBounds.bottom - clientBounds.top));
+    const int panelWidth = std::min(
+        kRuntimeErrorPanelWidth,
+        std::max(240, clientWidth - 32));
+    const int panelLeft = std::max(16, (clientWidth - panelWidth) / 2);
+    const int panelTop = std::max(
+        kTitleBarHeight + 24,
+        (clientHeight - kRuntimeErrorPanelHeight) / 2);
+    const int buttonGroupWidth = (kRuntimeErrorButtonWidth * 3)
+        + (kRuntimeErrorButtonGap * 2);
+    const int buttonLeft = panelLeft
+        + std::max(0, (panelWidth - buttonGroupWidth) / 2);
+    const int buttonTop = panelTop + kRuntimeErrorTitleHeight + 8
+        + kRuntimeErrorDetailHeight + 16;
+    const UINT visibilityFlags = SWP_NOACTIVATE
+        | (g_runtimeErrorVisible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+
+    const auto placeControl = [visibilityFlags](
+                                  HWND control,
+                                  int x,
+                                  int y,
+                                  int width,
+                                  int height) {
+        if (control)
+        {
+            SetWindowPos(
+                control,
+                HWND_TOP,
+                x,
+                y,
+                width,
+                height,
+                visibilityFlags);
+        }
+    };
+
+    placeControl(
+        g_runtimeErrorTitle,
+        panelLeft,
+        panelTop,
+        panelWidth,
+        kRuntimeErrorTitleHeight);
+    placeControl(
+        g_runtimeErrorDetail,
+        panelLeft,
+        panelTop + kRuntimeErrorTitleHeight + 8,
+        panelWidth,
+        kRuntimeErrorDetailHeight);
+    placeControl(
+        g_runtimeOpenButton,
+        buttonLeft,
+        buttonTop,
+        kRuntimeErrorButtonWidth,
+        kRuntimeErrorButtonHeight);
+    placeControl(
+        g_runtimeRetryButton,
+        buttonLeft + kRuntimeErrorButtonWidth + kRuntimeErrorButtonGap,
+        buttonTop,
+        kRuntimeErrorButtonWidth,
+        kRuntimeErrorButtonHeight);
+    placeControl(
+        g_runtimeCloseButton,
+        buttonLeft + ((kRuntimeErrorButtonWidth + kRuntimeErrorButtonGap) * 2),
+        buttonTop,
+        kRuntimeErrorButtonWidth,
+        kRuntimeErrorButtonHeight);
 }
 
 /*
@@ -605,6 +1010,8 @@ void LayoutWindow(HWND window)
             kTitleBarHeight,
             SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
+
+    LayoutRuntimeErrorControls(window);
 
     if (g_controller)
     {
@@ -768,29 +1175,131 @@ bool InitializeOpacityControls(HWND window, int opacityPercent)
     return true;
 }
 
+/*
+ * Create the Runtime recovery controls as ordinary Win32 children. Keeping
+ * this panel outside WebView2 makes the missing-runtime path actionable while
+ * still avoiding a bundled Evergreen or Fixed Version runtime.
+ */
+bool InitializeRuntimeErrorControls(HWND window)
+{
+    g_runtimeErrorTitle = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"未检测到 Microsoft Edge WebView2 Runtime",
+        WS_CHILD | SS_CENTER | SS_CENTERIMAGE | SS_NOPREFIX,
+        0,
+        0,
+        0,
+        0,
+        window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRuntimeErrorTitleId)),
+        g_module,
+        nullptr);
+
+    g_runtimeErrorDetail = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"",
+        WS_CHILD | SS_CENTER | SS_NOPREFIX,
+        0,
+        0,
+        0,
+        0,
+        window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRuntimeErrorDetailId)),
+        g_module,
+        nullptr);
+
+    g_runtimeOpenButton = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"打开官方下载页面",
+        WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+        0,
+        0,
+        0,
+        0,
+        window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRuntimeOpenButtonId)),
+        g_module,
+        nullptr);
+
+    g_runtimeRetryButton = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"重新检测",
+        WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+        0,
+        0,
+        0,
+        0,
+        window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRuntimeRetryButtonId)),
+        g_module,
+        nullptr);
+
+    g_runtimeCloseButton = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"关闭",
+        WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+        0,
+        0,
+        0,
+        0,
+        window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRuntimeCloseButtonId)),
+        g_module,
+        nullptr);
+
+    // Roll back partial creation so a failed fallback setup cannot leave
+    // dangling child handles in the resize and command paths.
+    if (!g_runtimeErrorTitle
+        || !g_runtimeErrorDetail
+        || !g_runtimeOpenButton
+        || !g_runtimeRetryButton
+        || !g_runtimeCloseButton)
+    {
+        if (g_runtimeCloseButton)
+        {
+            DestroyWindow(g_runtimeCloseButton);
+            g_runtimeCloseButton = nullptr;
+        }
+        if (g_runtimeRetryButton)
+        {
+            DestroyWindow(g_runtimeRetryButton);
+            g_runtimeRetryButton = nullptr;
+        }
+        if (g_runtimeOpenButton)
+        {
+            DestroyWindow(g_runtimeOpenButton);
+            g_runtimeOpenButton = nullptr;
+        }
+        if (g_runtimeErrorDetail)
+        {
+            DestroyWindow(g_runtimeErrorDetail);
+            g_runtimeErrorDetail = nullptr;
+        }
+        if (g_runtimeErrorTitle)
+        {
+            DestroyWindow(g_runtimeErrorTitle);
+            g_runtimeErrorTitle = nullptr;
+        }
+        return false;
+    }
+
+    g_runtimeErrorVisible = false;
+    LayoutRuntimeErrorControls(window);
+    return true;
+}
+
 std::wstring GetWebView2UserDataPath()
 {
-    PWSTR localAppDataPath = nullptr;
-    if (FAILED(SHGetKnownFolderPath(
-            FOLDERID_LocalAppData,
-            KF_FLAG_DEFAULT,
-            nullptr,
-            &localAppDataPath))
-        || !localAppDataPath)
+    const std::wstring addonDirectory = GetAddonLocalDataDirectory();
+    if (addonDirectory.empty())
     {
         return {};
     }
-
-    const std::wstring addonDirectory =
-        std::wstring(localAppDataPath) + L"\\" + kAddonFileBaseName;
-    CoTaskMemFree(localAppDataPath);
-
-    if (!CreateDirectoryW(addonDirectory.c_str(), nullptr)
-        && GetLastError() != ERROR_ALREADY_EXISTS)
-    {
-        return {};
-    }
-
     const std::wstring userDataDirectory = addonDirectory + L"\\WebView2";
     if (!CreateDirectoryW(userDataDirectory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
     {
@@ -874,11 +1383,110 @@ void SetBrowserStatus(HWND window, const wchar_t* status)
         InvalidateRect(window, nullptr, FALSE);
     }
 
-    OutputDebugStringW(status);
-    OutputDebugStringW(L"\n");
+    LogMessage(L"STATUS", status);
+}
+
+/*
+ * Leave the embedded surface only for an explicit external-navigation or
+ * download action. ShellExecuteW uses the user's registered browser and
+ * reports launch failures through values at or below 32 rather than HRESULTs.
+ */
+bool OpenExternalUrl(const wchar_t* url)
+{
+    if (!url || !*url)
+    {
+        return false;
+    }
+
+    const HINSTANCE launchResult = ShellExecuteW(
+        nullptr,
+        L"open",
+        url,
+        nullptr,
+        nullptr,
+        SW_SHOWNORMAL);
+    return reinterpret_cast<INT_PTR>(launchResult) > 32;
+}
+
+/*
+ * WebView2 exposes this native probe before environment creation. The version
+ * string is allocated by the task allocator, so every non-null result is
+ * released here; a missing or empty version means the Evergreen Runtime is
+ * not available to this process.
+ */
+bool IsWebView2RuntimeAvailable()
+{
+    LPWSTR versionInfo = nullptr;
+    const HRESULT result = GetAvailableCoreWebView2BrowserVersionString(
+        nullptr,
+        &versionInfo);
+    const bool available = SUCCEEDED(result) && versionInfo && *versionInfo;
+    if (versionInfo)
+    {
+        CoTaskMemFree(versionInfo);
+    }
+    return available;
+}
+
+void HideWebView2RuntimeError(HWND window)
+{
+    g_runtimeErrorVisible = false;
+    if (g_runtimeOpenButton)
+    {
+        EnableWindow(g_runtimeOpenButton, FALSE);
+    }
+    if (g_runtimeRetryButton)
+    {
+        EnableWindow(g_runtimeRetryButton, FALSE);
+    }
+    if (g_runtimeCloseButton)
+    {
+        EnableWindow(g_runtimeCloseButton, FALSE);
+    }
+    LayoutRuntimeErrorControls(window);
+}
+
+/*
+ * Show a self-contained recovery path for the only dependency that cannot be
+ * shipped inside this small addon. The installer is deliberately not started
+ * by the plugin; the user chooses the official page and then retries.
+ */
+void ShowWebView2RuntimeMissing(HWND window)
+{
+    SetBrowserStatus(window, L"小夭竺宝典 - 未检测到 WebView2 Runtime");
+    if (g_runtimeErrorTitle)
+    {
+        SetWindowTextW(
+            g_runtimeErrorTitle,
+            L"未检测到 Microsoft Edge WebView2 Runtime");
+    }
+    if (g_runtimeErrorDetail)
+    {
+        SetWindowTextW(
+            g_runtimeErrorDetail,
+            L"当前电脑没有检测到 Microsoft Edge WebView2 Runtime。\r\n"
+            L"请安装后点击“重新检测”。插件不会自动下载或执行安装程序。");
+    }
+    g_runtimeErrorVisible = true;
+    if (g_runtimeOpenButton)
+    {
+        EnableWindow(g_runtimeOpenButton, TRUE);
+    }
+    if (g_runtimeRetryButton)
+    {
+        EnableWindow(g_runtimeRetryButton, TRUE);
+    }
+    if (g_runtimeCloseButton)
+    {
+        EnableWindow(g_runtimeCloseButton, TRUE);
+    }
+    LayoutRuntimeErrorControls(window);
+    InvalidateRect(window, nullptr, FALSE);
 }
 
 void StartBrowserThread();
+HRESULT InitializeWebView(HWND window, const std::wstring& url);
+void RetryWebView2Initialization(HWND window);
 
 // Reuse a live window only when it is still in the current browsing session.
 // A manual close destroys that session, so the fallback starts a fresh STA
@@ -934,7 +1542,7 @@ void RegisterQuickAccess()
         || !g_nexusApi->QuickAccess_Add
         || !g_nexusApi->QuickAccess_Remove)
     {
-        OutputDebugStringW(L"小夭竺宝典 - Nexus Quick Access API unavailable\n");
+        LogMessage(L"ERROR", L"Nexus Quick Access API 不可用");
         return;
     }
 
@@ -953,8 +1561,7 @@ void RegisterQuickAccess()
         // Keep the addon reachable if an installation omitted the optional
         // PNG or an older Nexus build cannot load file textures; normal
         // packaging uses the custom icon path above.
-        OutputDebugStringW(
-            L"小夭竺宝典 - custom Quick Access icon unavailable; using Nexus fallback\n");
+        LogMessage(L"WARN", L"自定义 Quick Access 图标不可用，改用 Nexus 默认图标");
     }
 
     // Quick Access invokes the registered keybind when the shortcut is
@@ -1023,12 +1630,10 @@ HRESULT HandleNewWindowRequested(
         return S_OK;
     }
 
-    const HINSTANCE launchResult = ShellExecuteW(
-        nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
-    if (reinterpret_cast<INT_PTR>(launchResult) <= 32)
+    if (!OpenExternalUrl(uri))
     {
-        // ShellExecuteW reports launch failures through values <= 32 rather
-        // than HRESULTs; keep that failure visible without changing the page.
+        // Keep the embedded page unchanged when the system association cannot
+        // launch the requested external page.
         SetBrowserStatus(g_browserWindow.load(), L"小夭竺宝典 - 无法打开默认浏览器");
     }
 
@@ -1145,6 +1750,38 @@ LRESULT CALLBACK BrowserWindowProc(HWND window, UINT message, WPARAM wParam, LPA
         {
             switch (LOWORD(wParam))
             {
+            case kRuntimeOpenButtonId:
+                if (OpenExternalUrl(kWebView2DownloadUrl))
+                {
+                    SetBrowserStatus(
+                        window,
+                        L"小夭竺宝典 - 已打开 WebView2 官方下载页面");
+                    if (g_runtimeErrorDetail)
+                    {
+                        SetWindowTextW(
+                            g_runtimeErrorDetail,
+                            L"安装完成后回到游戏，点击“重新检测”即可继续。\r\n"
+                            L"插件不会自动下载或执行安装程序。");
+                    }
+                }
+                else
+                {
+                    SetBrowserStatus(window, L"小夭竺宝典 - 无法打开官方下载页面");
+                    if (g_runtimeErrorDetail)
+                    {
+                        SetWindowTextW(
+                            g_runtimeErrorDetail,
+                            L"无法打开系统默认浏览器，请手动访问：\r\n"
+                            L"https://developer.microsoft.com/microsoft-edge/webview2/");
+                    }
+                }
+                return 0;
+            case kRuntimeRetryButtonId:
+                RetryWebView2Initialization(window);
+                return 0;
+            case kRuntimeCloseButtonId:
+                PostMessageW(window, WM_CLOSE, 0, 0);
+                return 0;
             case kMinimizeButtonId:
                 ShowWindow(window, SW_MINIMIZE);
                 return 0;
@@ -1186,6 +1823,12 @@ LRESULT CALLBACK BrowserWindowProc(HWND window, UINT message, WPARAM wParam, LPA
         g_minimizeButton = nullptr;
         g_maximizeButton = nullptr;
         g_closeButton = nullptr;
+        g_runtimeErrorTitle = nullptr;
+        g_runtimeErrorDetail = nullptr;
+        g_runtimeOpenButton = nullptr;
+        g_runtimeRetryButton = nullptr;
+        g_runtimeCloseButton = nullptr;
+        g_runtimeErrorVisible = false;
         g_browserWindow.store(nullptr);
         PostQuitMessage(0);
         return 0;
@@ -1197,10 +1840,23 @@ LRESULT CALLBACK BrowserWindowProc(HWND window, UINT message, WPARAM wParam, LPA
 
 HRESULT InitializeWebView(HWND window, const std::wstring& url)
 {
+    LogMessage(L"INFO", L"开始初始化 WebView2");
+    HideWebView2RuntimeError(window);
+    if (!IsWebView2RuntimeAvailable())
+    {
+        LogMessage(L"ERROR", L"未检测到 WebView2 Runtime");
+        ShowWebView2RuntimeMissing(window);
+        FinishInitialization();
+        // S_FALSE is handled by the caller without replacing the actionable
+        // Chinese Runtime panel with a generic initialization error.
+        return S_FALSE;
+    }
+
     const std::wstring userDataPath = GetWebView2UserDataPath();
     if (userDataPath.empty())
     {
-        SetBrowserStatus(window, L"小夭竺宝典 - cannot create WebView2 data directory");
+        LogMessage(L"ERROR", L"无法创建 WebView2 数据目录");
+        SetBrowserStatus(window, L"小夭竺宝典 - 无法创建 WebView2 数据目录");
         FinishInitialization();
         return E_FAIL;
     }
@@ -1214,7 +1870,8 @@ HRESULT InitializeWebView(HWND window, const std::wstring& url)
             {
                 if (FAILED(result) || !environment)
                 {
-                    SetBrowserStatus(window, L"小夭竺宝典 - WebView2 Runtime is unavailable");
+                    LogHresult(L"WebView2 环境创建", result);
+                    ShowWebView2RuntimeMissing(window);
                     FinishInitialization();
                     return S_OK;
                 }
@@ -1232,7 +1889,8 @@ HRESULT InitializeWebView(HWND window, const std::wstring& url)
                         {
                             if (FAILED(result) || !controller)
                             {
-                                SetBrowserStatus(window, L"小夭竺宝典 - cannot create embedded browser");
+                                LogHresult(L"WebView2 控制器创建", result);
+                                SetBrowserStatus(window, L"小夭竺宝典 - 无法创建内嵌浏览器");
                                 FinishInitialization();
                                 return S_OK;
                             }
@@ -1248,7 +1906,8 @@ HRESULT InitializeWebView(HWND window, const std::wstring& url)
                             HRESULT hr = g_controller->get_CoreWebView2(&g_webView);
                             if (FAILED(hr) || !g_webView)
                             {
-                                SetBrowserStatus(window, L"小夭竺宝典 - cannot access WebView2 control");
+                                LogHresult(L"获取 WebView2 控件", hr);
+                                SetBrowserStatus(window, L"小夭竺宝典 - 无法访问 WebView2 控件");
                                 g_controller->Close();
                                 g_controller.Reset();
                                 FinishInitialization();
@@ -1268,7 +1927,8 @@ HRESULT InitializeWebView(HWND window, const std::wstring& url)
                                 &g_newWindowToken);
                             if (FAILED(hr))
                             {
-                                SetBrowserStatus(window, L"小夭竺宝典 - failed to bind navigation handler");
+                                LogHresult(L"绑定新窗口处理器", hr);
+                                SetBrowserStatus(window, L"小夭竺宝典 - 无法绑定新窗口处理器");
                                 g_webView.Reset();
                                 g_controller->Close();
                                 g_controller.Reset();
@@ -1280,7 +1940,8 @@ HRESULT InitializeWebView(HWND window, const std::wstring& url)
                             hr = g_webView->Navigate(url.c_str());
                             if (FAILED(hr))
                             {
-                                SetBrowserStatus(window, L"小夭竺宝典 - navigation failed");
+                                LogHresult(L"页面导航", hr);
+                                SetBrowserStatus(window, L"小夭竺宝典 - 页面导航失败");
                             }
 
                             FinishInitialization();
@@ -1289,17 +1950,44 @@ HRESULT InitializeWebView(HWND window, const std::wstring& url)
 
                 if (FAILED(controllerResult))
                 {
-                    SetBrowserStatus(window, L"小夭竺宝典 - controller creation failed");
+                    LogHresult(L"请求 WebView2 控制器", controllerResult);
+                    SetBrowserStatus(window, L"小夭竺宝典 - 无法创建浏览器控制器");
                     FinishInitialization();
                 }
                 return S_OK;
             }).Get());
 }
 
+/*
+ * Retry runs on the WebView2 STA thread after the user has installed the
+ * dependency. One guard prevents a double-click from starting overlapping
+ * environment callbacks against the same window and COM apartment.
+ */
+void RetryWebView2Initialization(HWND window)
+{
+    if (!window
+        || g_shutdownRequested.load()
+        || !g_initializationComplete.load())
+    {
+        return;
+    }
+
+    g_initializationComplete.store(false);
+    SetBrowserStatus(window, L"小夭竺宝典 - 正在重新检测 WebView2 Runtime");
+    const HRESULT result = InitializeWebView(window, g_browserUrl);
+    if (FAILED(result))
+    {
+        SetBrowserStatus(window, L"小夭竺宝典 - WebView2 初始化失败");
+        FinishInitialization();
+    }
+}
+
 void BrowserThreadMain(std::wstring url)
 {
     BrowserThreadRunningGuard runningGuard;
     g_browserThreadId.store(GetCurrentThreadId());
+    g_browserUrl = url;
+    LogMessage(L"INFO", L"浏览器线程启动");
 
     MSG queuedMessage{};
     PeekMessageW(&queuedMessage, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
@@ -1307,7 +1995,8 @@ void BrowserThreadMain(std::wstring url)
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(comResult))
     {
-        SetBrowserStatus(nullptr, L"小夭竺宝典 - COM initialization failed");
+        LogHresult(L"COM 初始化", comResult);
+        SetBrowserStatus(nullptr, L"小夭竺宝典 - COM 初始化失败");
         g_browserThreadId.store(0);
         return;
     }
@@ -1325,7 +2014,7 @@ void BrowserThreadMain(std::wstring url)
     const ATOM registeredClass = RegisterClassExW(&windowClass);
     if (!registeredClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
     {
-        SetBrowserStatus(nullptr, L"小夭竺宝典 - window class registration failed");
+        SetBrowserStatus(nullptr, L"小夭竺宝典 - 窗口类注册失败");
         CoUninitialize();
         g_browserThreadId.store(0);
         return;
@@ -1354,7 +2043,7 @@ void BrowserThreadMain(std::wstring url)
 
     if (!window)
     {
-        SetBrowserStatus(nullptr, L"小夭竺宝典 - window creation failed");
+        SetBrowserStatus(nullptr, L"小夭竺宝典 - 窗口创建失败");
         if (registeredClass)
         {
             UnregisterClassW(kWindowClassName, g_module);
@@ -1379,7 +2068,7 @@ void BrowserThreadMain(std::wstring url)
     {
         // A z-order failure must not abort the browser, but it is useful in
         // diagnostics because the requested always-on-top invariant was lost.
-        OutputDebugStringW(L"小夭竺宝典 - topmost window setup failed\n");
+        LogMessage(L"WARN", L"窗口置顶设置失败");
     }
 
     if (g_shutdownRequested.load())
@@ -1393,7 +2082,11 @@ void BrowserThreadMain(std::wstring url)
         // The browser remains usable if the optional native toolbar cannot load.
         if (!InitializeOpacityControls(window, configuredOpacity))
         {
-            OutputDebugStringW(L"小夭竺宝典 - opacity control creation failed\n");
+            LogMessage(L"ERROR", L"透明度控件创建失败");
+        }
+        if (!InitializeRuntimeErrorControls(window))
+        {
+            LogMessage(L"ERROR", L"Runtime 提示控件创建失败");
         }
         ApplyWindowOpacity(window, configuredOpacity);
         LayoutWindow(window);
@@ -1403,7 +2096,7 @@ void BrowserThreadMain(std::wstring url)
         const HRESULT initializationResult = InitializeWebView(window, url);
         if (FAILED(initializationResult))
         {
-            SetBrowserStatus(window, L"小夭竺宝典 - initialization failed");
+            SetBrowserStatus(window, L"小夭竺宝典 - WebView2 初始化失败");
         }
     }
 
@@ -1430,6 +2123,7 @@ void BrowserThreadMain(std::wstring url)
     }
 
     CoUninitialize();
+    LogMessage(L"INFO", L"浏览器线程退出");
     g_browserThreadId.store(0);
 }
 
@@ -1482,7 +2176,7 @@ void StartBrowserThread()
     catch (...)
     {
         g_browserThreadRunning.store(false);
-        OutputDebugStringW(L"小夭竺宝典 - browser thread creation failed\n");
+        LogMessage(L"ERROR", L"浏览器线程创建失败");
     }
 }
 
@@ -1492,6 +2186,8 @@ void AddonLoad(AddonAPI_t* api)
     g_shutdownRequested.store(false);
     g_addonUnloadRequested.store(false);
     g_initializationComplete.store(false);
+    InstallCrashHandler();
+    LogMessage(L"INFO", L"插件加载");
     RegisterQuickAccess();
     StartBrowserThread();
 }
@@ -1499,6 +2195,7 @@ void AddonLoad(AddonAPI_t* api)
 void AddonUnload()
 {
     g_addonUnloadRequested.store(true);
+    LogMessage(L"INFO", L"插件开始卸载");
     UnregisterQuickAccess();
     g_nexusApi = nullptr;
 
@@ -1518,6 +2215,8 @@ void AddonUnload()
     {
         g_browserThread.join();
     }
+    LogMessage(L"INFO", L"插件卸载完成");
+    UninstallCrashHandler();
 }
 }
 
@@ -1527,7 +2226,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef()
         static_cast<uint32_t>(-20260910),
         kNexusApiVersion,
         "小夭竺宝典",
-        {1, 0, 0, 0},
+        {1, 0, 1, 0},
         "协同学院",
         "【激战2的小夭竺】视频攻略大全",
         AddonLoad,

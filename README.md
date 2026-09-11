@@ -74,7 +74,9 @@ Opacity=100
 
 只接受 `http://` 和 `https://` URL；无效地址会回退到默认页面。透明度支持 `30` 到 `100`。
 
-插件不捆绑 WebView2 Runtime。目标机器需要先安装 Microsoft Edge WebView2 Runtime；运行时缺失时插件会显示错误状态，不会把主页面改为系统浏览器。
+插件不捆绑 WebView2 Runtime。目标机器需要先安装 Microsoft Edge WebView2 Runtime；启动时会先检测运行时。若缺失，插件会显示中文提示面板，可打开微软官方下载页面或重新检测；插件不会自动下载或执行安装程序，也不会把主页面改为系统浏览器。
+
+诊断文件写入 `%LOCALAPPDATA%\YaoZhuGuide\YaoZhuGuide.log`，按 UTF-8 保存时间、进程/线程、状态和 HRESULT；日志超过 2 MiB 会自动截断。未处理异常会尽力生成 `%LOCALAPPDATA%\YaoZhuGuide\CrashDumps\*.dmp`，并继续交给 Nexus/游戏原有的崩溃处理流程。
 
 ## 发布
 
