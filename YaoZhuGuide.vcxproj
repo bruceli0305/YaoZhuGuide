@@ -104,6 +104,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="YaoZhuGuide.cpp" />
+    <ClInclude Include="resource.h" />
+    <ResourceCompile Include="YaoZhuGuide.rc" />
     <None Include="YaoZhuGuide.ini" />
     <None Include="assets\YaoZhuGuideIcon.png" />
   </ItemGroup>

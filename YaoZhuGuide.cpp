@@ -6,6 +6,7 @@
 #include <dbghelp.h>
 #include <wrl.h>
 #include <WebView2.h>
+#include "resource.h"
 
 #include <algorithm>
 #include <atomic>
@@ -39,6 +40,8 @@ struct NexusTexture_t
 };
 using NexusTextureGetOrCreateFromFileFn = NexusTexture_t* (*)(
     const char*, const char*);
+using NexusTextureGetOrCreateFromResourceFn = NexusTexture_t* (*)(
+    const char*, unsigned, HMODULE);
 
 struct AddonAPI_t
 {
@@ -83,7 +86,7 @@ struct AddonAPI_t
     NexusOpaqueFn DataLink_Share;
     NexusOpaqueFn Textures_Get;
     NexusTextureGetOrCreateFromFileFn Textures_GetOrCreateFromFile;
-    NexusOpaqueFn Textures_GetOrCreateFromResource;
+    NexusTextureGetOrCreateFromResourceFn Textures_GetOrCreateFromResource;
     NexusOpaqueFn Textures_GetOrCreateFromURL;
     NexusOpaqueFn Textures_GetOrCreateFromMemory;
     NexusOpaqueFn Textures_LoadFromFile;
@@ -142,9 +145,8 @@ namespace
 constexpr UINT kShutdownMessage = WM_APP + 1;
 constexpr wchar_t kWindowClassName[] = L"YaoZhuGuideWindowClass";
 constexpr wchar_t kAddonFileBaseName[] = L"YaoZhuGuide";
-constexpr wchar_t kAddonIconFileName[] = L"YaoZhuGuideIcon.png";
 constexpr wchar_t kAddonDisplayName[] = L"小夭竺宝典";
-constexpr wchar_t kDefaultUrl[] = L"https://v2.gw2.org.cn/guides/bilibili-1846648930-c-8136102";
+constexpr wchar_t kDefaultUrl[] = L"https://v2.gw2.org.cn/bilibili-topic";
 constexpr int kDefaultWindowWidth = 1000;
 constexpr int kDefaultWindowHeight = 640;
 // These offsets reproduce the placement in the supplied 1920x1080 screenshot.
@@ -1371,6 +1373,10 @@ std::wstring ReadConfiguredUrl()
         configPath.c_str());
 
     const std::wstring configuredUrl(value);
+    if (configuredUrl == L"https://v2.gw2.org.cn/guides/bilibili-1846648930-c-8136102")
+    {
+        return kDefaultUrl;
+    }
     return IsHttpUrl(configuredUrl) ? configuredUrl : kDefaultUrl;
 }
 
@@ -1546,21 +1552,18 @@ void RegisterQuickAccess()
         return;
     }
 
-    const std::string iconPath = WideToUtf8(
-        GetModuleDirectory() + kAddonIconFileName);
     const char* textureIdentifier = kNexusIconIdentifier;
-    if (g_nexusApi->Textures_GetOrCreateFromFile && !iconPath.empty()
-        && g_nexusApi->Textures_GetOrCreateFromFile(
-               kNexusTextureIdentifier,
-               iconPath.c_str()))
+    if (g_nexusApi->Textures_GetOrCreateFromResource
+        && FindResourceW(g_module, MAKEINTRESOURCEW(IDR_YAOZHU_ICON), L"PNG"))
     {
+        // Nexus queues texture creation. Quick Access resolves the identifier
+        // later even when this first request returns nullptr.
+        g_nexusApi->Textures_GetOrCreateFromResource(
+            kNexusTextureIdentifier, IDR_YAOZHU_ICON, g_module);
         textureIdentifier = kNexusTextureIdentifier;
     }
     else
     {
-        // Keep the addon reachable if an installation omitted the optional
-        // PNG or an older Nexus build cannot load file textures; normal
-        // packaging uses the custom icon path above.
         LogMessage(L"WARN", L"自定义 Quick Access 图标不可用，改用 Nexus 默认图标");
     }
 
@@ -2227,7 +2230,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef()
         0xEA4022D7u,
         kNexusApiVersion,
         "小夭竺宝典",
-        {1, 0, 1, 0},
+        {1, 0, 3, 0},
         "协同学院",
         "【激战2的小夭竺】视频攻略大全",
         AddonLoad,
